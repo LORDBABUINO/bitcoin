@@ -173,6 +173,13 @@ if(ENABLE_WALLET)
   endif()
 endif()
 
+# Utreexo FFI library (external, pre-built)
+if(WITH_UTREEXO)
+  add_library(utreexo_ffi STATIC IMPORTED GLOBAL)
+  set_target_properties(utreexo_ffi PROPERTIES
+      IMPORTED_LOCATION "${UTREEXO_LIB_PATH}"
+  )
+endif()
 
 # P2P and RPC server functionality used by `bitcoind` and `bitcoin-qt` executables.
 add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
@@ -194,6 +201,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   index/blockfilterindex.cpp
   index/coinstatsindex.cpp
   index/txindex.cpp
+  index/updateutreexo.cpp
   init.cpp
   kernel/chain.cpp
   kernel/checks.cpp
@@ -278,6 +286,7 @@ target_link_libraries(bitcoin_node
     bitcoin_common
     bitcoin_util
     $<TARGET_NAME_IF_EXISTS:bitcoin_zmq>
+    $<TARGET_NAME_IF_EXISTS:utreexo_ffi>
     leveldb
     minisketch
     univalue
@@ -286,6 +295,8 @@ target_link_libraries(bitcoin_node
     $<TARGET_NAME_IF_EXISTS:libevent::extra>
     $<TARGET_NAME_IF_EXISTS:libevent::pthreads>
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
+    $<$<TARGET_EXISTS:utreexo_ffi>:${CMAKE_DL_LIBS}>
+    $<$<TARGET_EXISTS:utreexo_ffi>:pthread>
 )
 
 # Bitcoin wrapper executable that can call other executables.
