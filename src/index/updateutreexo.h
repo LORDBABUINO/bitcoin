@@ -6,8 +6,11 @@
 #define BITCOIN_INDEX_UPDATEUTREEXO_H
 
 #include <index/base.h>
+
 #include <cstddef>
 #include <memory>
+
+struct UtreexoForest;
 
 namespace interfaces {
 class Chain;
@@ -22,6 +25,7 @@ protected:
 
 private:
     const std::unique_ptr<DB> m_db;
+    UtreexoForest* m_forest;
 
     bool AllowPrune() const override { return false; }
 
@@ -31,7 +35,7 @@ protected:
 
 public:
     explicit UpdateUtreexo(std::unique_ptr<interfaces::Chain> chain, size_t n_cache_size,
-                        bool f_memory = false, bool f_wipe = false);
+                           bool f_memory = false, bool f_wipe = false);
     virtual ~UpdateUtreexo() override;
 };
 

@@ -2,11 +2,34 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <index/updateutreexo.h>
-
 #include <common/args.h>
+#include <crypto/sha2.hpp>
+#include <crypto/sha512.h>
+#include <hash.h>
+#include <index/updateutreexo.h>
 #include <logging.h>
+#include <primitives/block.h>
+#include <primitives/transaction.h>
+#include <serialize.h>
+#include <streams.h>
+#include <uint256.h>
 #include <util/rustreexo.h>
+
+#include <cstring>
+#include <stdexcept>
+#include <vector>
+// Compute Utreexo tag: SHA-512("UtreexoV1")
+static const unsigned char* GetUtreexoTag()
+{
+    static unsigned char tag[CSHA512::OUTPUT_SIZE];
+    static bool initialized = false;
+    if (!initialized) {
+        const char* tag_string = "UtreexoV1";
+        CSHA512().Write(reinterpret_cast<const unsigned char*>(tag_string), strlen(tag_string)).Finalize(tag);
+        initialized = true;
+    }
+    return tag;
+}
 
 std::unique_ptr<UpdateUtreexo> g_updateutreexo;
 
@@ -19,18 +42,102 @@ public:
 UpdateUtreexo::DB::DB(size_t n_cache_size, bool f_memory, bool f_wipe)
     : BaseIndex::DB(gArgs.GetDataDirNet() / "indexes" / "updateutreexo",
                     n_cache_size, f_memory, f_wipe)
-{}
+{
+
+}
 
 UpdateUtreexo::UpdateUtreexo(std::unique_ptr<interfaces::Chain> chain, size_t n_cache_size,
                              bool f_memory, bool f_wipe)
     : BaseIndex(std::move(chain), "updateutreexo"),
-      m_db(std::make_unique<UpdateUtreexo::DB>(n_cache_size, f_memory, f_wipe))
-{}
+      m_db(std::make_unique<UpdateUtreexo::DB>(n_cache_size, f_memory, f_wipe)),
+      m_forest(utreexo_forest_new())
+{
+    if (!m_forest) {
+        throw std::runtime_error("Failed to create Utreexo forest");
+    }
+    LogInfo("Utreexo forest initialized\n");
+}
 
-UpdateUtreexo::~UpdateUtreexo() = default;
+UpdateUtreexo::~UpdateUtreexo()
+{
+    if (m_forest) {
+        utreexo_forest_free(m_forest);
+        m_forest = nullptr;
+        LogInfo("Utreexo forest freed\n");
+    }
+}
 
-bool UpdateUtreexo::CustomAppend(const interfaces::BlockInfo& block) {
-    printHello();
+bool UpdateUtreexo::CustomAppend(const interfaces::BlockInfo& block)
+{
+    // Skip genesis block
+    if (block.height == 0) return true;
+
+    if (!block.data) {
+        LogWarning("UpdateUtreexo: Block data not available for height %d\n", block.height);
+        return false;
+    }
+
+    const unsigned char* utreexo_tag = GetUtreexoTag();
+    std::vector<uint8_t> utxo_hashes;
+    size_t total_utxos = 0;
+
+    for (const auto& tx : block.data->vtx) {
+        const Txid& txid = tx->GetHash();
+        const bool is_coinbase = tx->IsCoinBase();
+
+        for (uint32_t vout = 0; vout < tx->vout.size(); ++vout) {
+            const CTxOut& output = tx->vout[vout];
+
+            uint32_t header_code = (static_cast<uint32_t>(block.height) << 1) | (is_coinbase ? 1 : 0);
+
+            DataStream script_stream;
+            script_stream << output.scriptPubKey;
+
+            std::vector<uint8_t> preimage;
+            preimage.reserve(64 + 64 + 32 + 32 + 4 + 4 + 8 + script_stream.size());
+
+            preimage.insert(preimage.end(), utreexo_tag, utreexo_tag + 64);
+            preimage.insert(preimage.end(), utreexo_tag, utreexo_tag + 64);
+
+            const uint8_t* block_hash = reinterpret_cast<const uint8_t*>(block.hash.data());
+            preimage.insert(preimage.end(), block_hash, block_hash + 32);
+
+            const uint8_t* txid_bytes = reinterpret_cast<const uint8_t*>(txid.data());
+            preimage.insert(preimage.end(), txid_bytes, txid_bytes + 32);
+
+            uint32_t vout_le = htole32(vout);
+            const uint8_t* vout_bytes = reinterpret_cast<const uint8_t*>(&vout_le);
+            preimage.insert(preimage.end(), vout_bytes, vout_bytes + 4);
+
+            uint32_t header_code_le = htole32(header_code);
+            const uint8_t* header_bytes = reinterpret_cast<const uint8_t*>(&header_code_le);
+            preimage.insert(preimage.end(), header_bytes, header_bytes + 4);
+
+            uint64_t amount_le = htole64(static_cast<uint64_t>(output.nValue));
+            const uint8_t* amount_bytes = reinterpret_cast<const uint8_t*>(&amount_le);
+            preimage.insert(preimage.end(), amount_bytes, amount_bytes + 8);
+
+            const uint8_t* script_bytes = reinterpret_cast<const uint8_t*>(script_stream.data());
+            preimage.insert(preimage.end(), script_bytes, script_bytes + script_stream.size());
+
+            sha2::sha256_hash leaf_hash = sha2::sha512_256(preimage.data(), preimage.size());
+
+            utxo_hashes.insert(utxo_hashes.end(), leaf_hash.begin(), leaf_hash.end());
+            ++total_utxos;
+        }
+    }
+
+    if (!utxo_hashes.empty()) {
+        int result = utreexo_forest_add(m_forest, utxo_hashes.data(), total_utxos);
+        if (result != 0) {
+            LogError("UpdateUtreexo: Failed to add %zu UTXOs to forest at height %d\n",
+                     total_utxos, block.height);
+            return false;
+        }
+        LogDebug(BCLog::ALL, "UpdateUtreexo: Added %zu UTXOs to forest at height %d\n",
+                 total_utxos, block.height);
+    }
+
     return true;
 }
 
