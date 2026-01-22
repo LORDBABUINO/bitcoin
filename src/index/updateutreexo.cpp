@@ -13,6 +13,8 @@
 #include <serialize.h>
 #include <streams.h>
 #include <uint256.h>
+#include <util/fs.h>
+#include <util/readwritefile.h>
 #include <util/rustreexo.h>
 
 #include <cstring>
@@ -46,24 +48,81 @@ UpdateUtreexo::DB::DB(size_t n_cache_size, bool f_memory, bool f_wipe)
 
 }
 
+bool UpdateUtreexo::LoadForest()
+{
+    if (!fs::exists(m_utreexo_path)) {
+        return false;
+    }
+
+    auto [ok, data] = ReadBinaryFile(m_utreexo_path);
+    if (!ok) {
+        LogWarning("Utreexo: Failed to read from %s\n", fs::PathToString(m_utreexo_path));
+        return false;
+    }
+
+    m_forest = utreexo_forest_deserialize(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    if (!m_forest) {
+        LogWarning("Utreexo: Failed to deserialize forest from %s\n", fs::PathToString(m_utreexo_path));
+        return false;
+    }
+
+    return true;
+}
+
+bool UpdateUtreexo::SaveForest()
+{
+    if (!m_forest) {
+        return false;
+    }
+
+    uint8_t* data = nullptr;
+    size_t len = 0;
+
+    if (utreexo_forest_serialize(m_forest, &data, &len) != 0) {
+        LogError("Utreexo: Failed to serialize forest\n");
+        return false;
+    }
+
+    std::string buffer(reinterpret_cast<const char*>(data), len);
+    utreexo_free_buffer(data);
+
+    if (!WriteBinaryFile(m_utreexo_path, buffer)) {
+        LogError("Utreexo: Failed to write to %s\n", fs::PathToString(m_utreexo_path));
+        return false;
+    }
+
+    return true;
+}
+
 UpdateUtreexo::UpdateUtreexo(std::unique_ptr<interfaces::Chain> chain, size_t n_cache_size,
                              bool f_memory, bool f_wipe)
     : BaseIndex(std::move(chain), "updateutreexo"),
       m_db(std::make_unique<UpdateUtreexo::DB>(n_cache_size, f_memory, f_wipe)),
-      m_forest(utreexo_forest_new())
+      m_forest(nullptr),
+      m_utreexo_path(gArgs.IsArgSet("-utreexopath") ?
+                     fs::PathFromString(gArgs.GetArg("-utreexopath", "")) :
+                     gArgs.GetDataDirNet() / "utreexo" / "forest.dat")
 {
-    if (!m_forest) {
-        throw std::runtime_error("Failed to create Utreexo forest");
+    fs::create_directories(m_utreexo_path.parent_path());
+
+    if (!LoadForest()) {
+        m_forest = utreexo_forest_new();
+        if (!m_forest) {
+            throw std::runtime_error("Failed to create Utreexo forest");
+        }
+        LogInfo("Utreexo: Created new forest at %s\n", fs::PathToString(m_utreexo_path));
+    } else {
+        LogInfo("Utreexo: Loaded forest from %s\n", fs::PathToString(m_utreexo_path));
     }
-    LogInfo("Utreexo forest initialized\n");
 }
 
 UpdateUtreexo::~UpdateUtreexo()
 {
     if (m_forest) {
+        SaveForest();
         utreexo_forest_free(m_forest);
         m_forest = nullptr;
-        LogInfo("Utreexo forest freed\n");
+        LogInfo("Utreexo: Forest saved and freed\n");
     }
 }
 
@@ -136,6 +195,11 @@ bool UpdateUtreexo::CustomAppend(const interfaces::BlockInfo& block)
         }
         LogDebug(BCLog::ALL, "UpdateUtreexo: Added %zu UTXOs to forest at height %d\n",
                  total_utxos, block.height);
+    }
+
+    if (!SaveForest()) {
+        LogError("UpdateUtreexo: Failed to save forest after block %d\n", block.height);
+        return false;
     }
 
     return true;

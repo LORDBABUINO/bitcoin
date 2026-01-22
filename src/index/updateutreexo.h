@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <util/fs.h>
 
 struct UtreexoForest;
 
@@ -26,8 +27,12 @@ protected:
 private:
     const std::unique_ptr<DB> m_db;
     UtreexoForest* m_forest;
+    const fs::path m_utreexo_path;
 
     bool AllowPrune() const override { return false; }
+
+    bool LoadForest();
+    bool SaveForest();
 
 protected:
     bool CustomAppend(const interfaces::BlockInfo& block) override;
