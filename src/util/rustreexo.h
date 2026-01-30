@@ -15,21 +15,29 @@ extern "C" {
 // Opaque pointer to Rust UtreexoForest struct
 typedef struct UtreexoForest UtreexoForest;
 
+// Buffer struct for returning data from Rust
+typedef struct {
+    uint8_t* data;
+    size_t len;
+} Buffer;
+
 // Create a new Utreexo forest
 UtreexoForest* utreexo_forest_new(void);
 
-// Add hashes to the forest
-// hashes: pointer to array of 32-byte hashes
-// num_hashes: number of hashes in the array
+// Modify the forest by adding and/or deleting hashes
+// forest: pointer to the forest
+// add_hashes: pointer to array of 32-byte hashes to add (can be NULL if num_add is 0)
+// num_add: number of hashes to add
+// del_hashes: pointer to array of 32-byte hashes to delete (can be NULL if num_del is 0)
+// num_del: number of hashes to delete
 // Returns: 0 on success, -1 on failure
-int utreexo_forest_add(UtreexoForest* forest, const uint8_t* hashes, size_t num_hashes);
+int utreexo_forest_modify(UtreexoForest* forest, const uint8_t* add_hashes, size_t num_add,
+                          const uint8_t* del_hashes, size_t num_del);
 
 // Serialize the Utreexo forest to bytes
 // forest: pointer to the forest
-// out_data: pointer to receive the allocated buffer (caller must free with utreexo_free_buffer)
-// out_len: pointer to receive the length of the buffer
-// Returns: 0 on success, -1 on failure
-int utreexo_forest_serialize(UtreexoForest* forest, uint8_t** out_data, size_t* out_len);
+// Returns: Buffer with data pointer and length (caller must free with utreexo_free_buffer)
+Buffer utreexo_forest_serialize(UtreexoForest* forest);
 
 // Deserialize the Utreexo forest from bytes
 // data: pointer to the serialized data

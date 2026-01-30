@@ -45,7 +45,6 @@ UpdateUtreexo::DB::DB(size_t n_cache_size, bool f_memory, bool f_wipe)
     : BaseIndex::DB(gArgs.GetDataDirNet() / "indexes" / "updateutreexo",
                     n_cache_size, f_memory, f_wipe)
 {
-
 }
 
 bool UpdateUtreexo::LoadForest()
@@ -75,18 +74,16 @@ bool UpdateUtreexo::SaveForest()
         return false;
     }
 
-    uint8_t* data = nullptr;
-    size_t len = 0;
-
-    if (utreexo_forest_serialize(m_forest, &data, &len) != 0) {
+    Buffer buffer = utreexo_forest_serialize(m_forest);
+    if (buffer.data == nullptr) {
         LogError("Utreexo: Failed to serialize forest\n");
         return false;
     }
 
-    std::string buffer(reinterpret_cast<const char*>(data), len);
-    utreexo_free_buffer(data);
+    std::string data(reinterpret_cast<const char*>(buffer.data), buffer.len);
+    utreexo_free_buffer(buffer.data);
 
-    if (!WriteBinaryFile(m_utreexo_path, buffer)) {
+    if (!WriteBinaryFile(m_utreexo_path, data)) {
         LogError("Utreexo: Failed to write to %s\n", fs::PathToString(m_utreexo_path));
         return false;
     }
@@ -100,8 +97,8 @@ UpdateUtreexo::UpdateUtreexo(std::unique_ptr<interfaces::Chain> chain, size_t n_
       m_db(std::make_unique<UpdateUtreexo::DB>(n_cache_size, f_memory, f_wipe)),
       m_forest(nullptr),
       m_utreexo_path(gArgs.IsArgSet("-utreexopath") ?
-                     fs::PathFromString(gArgs.GetArg("-utreexopath", "")) :
-                     gArgs.GetDataDirNet() / "utreexo" / "forest.dat")
+                         fs::PathFromString(gArgs.GetArg("-utreexopath", "")) :
+                         gArgs.GetDataDirNet() / "utreexo" / "forest.dat")
 {
     fs::create_directories(m_utreexo_path.parent_path());
 
@@ -187,7 +184,7 @@ bool UpdateUtreexo::CustomAppend(const interfaces::BlockInfo& block)
     }
 
     if (!utxo_hashes.empty()) {
-        int result = utreexo_forest_add(m_forest, utxo_hashes.data(), total_utxos);
+        int result = utreexo_forest_modify(m_forest, utxo_hashes.data(), total_utxos, nullptr, 0);
         if (result != 0) {
             LogError("UpdateUtreexo: Failed to add %zu UTXOs to forest at height %d\n",
                      total_utxos, block.height);
