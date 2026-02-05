@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <coins.h>
 #include <common/args.h>
 #include <crypto/sha2.hpp>
 #include <crypto/sha512.h>
@@ -13,6 +14,7 @@
 #include <serialize.h>
 #include <streams.h>
 #include <uint256.h>
+#include <undo.h>
 #include <util/fs.h>
 #include <util/readwritefile.h>
 #include <util/rustreexo.h>
@@ -20,6 +22,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <vector>
+
 // Compute Utreexo tag: SHA-512("UtreexoV1")
 static const unsigned char* GetUtreexoTag()
 {
@@ -31,6 +34,48 @@ static const unsigned char* GetUtreexoTag()
         initialized = true;
     }
     return tag;
+}
+
+static sha2::sha256_hash ComputeLeafHash(
+    const unsigned char* utreexo_tag,
+    const uint8_t* block_hash_data,
+    const uint8_t* txid_data,
+    uint32_t vout,
+    uint32_t height,
+    bool is_coinbase,
+    const CTxOut& output)
+{
+    uint32_t header_code = (height << 1) | (is_coinbase ? 1 : 0);
+
+    DataStream script_stream;
+    script_stream << output.scriptPubKey;
+
+    std::vector<uint8_t> preimage;
+    preimage.reserve(64 + 64 + 32 + 32 + 4 + 4 + 8 + script_stream.size());
+
+    preimage.insert(preimage.end(), utreexo_tag, utreexo_tag + 64);
+    preimage.insert(preimage.end(), utreexo_tag, utreexo_tag + 64);
+
+    preimage.insert(preimage.end(), block_hash_data, block_hash_data + 32);
+
+    preimage.insert(preimage.end(), txid_data, txid_data + 32);
+
+    uint32_t vout_le = htole32(vout);
+    const uint8_t* vout_bytes = reinterpret_cast<const uint8_t*>(&vout_le);
+    preimage.insert(preimage.end(), vout_bytes, vout_bytes + 4);
+
+    uint32_t header_code_le = htole32(header_code);
+    const uint8_t* header_bytes = reinterpret_cast<const uint8_t*>(&header_code_le);
+    preimage.insert(preimage.end(), header_bytes, header_bytes + 4);
+
+    uint64_t amount_le = htole64(static_cast<uint64_t>(output.nValue));
+    const uint8_t* amount_bytes = reinterpret_cast<const uint8_t*>(&amount_le);
+    preimage.insert(preimage.end(), amount_bytes, amount_bytes + 8);
+
+    const uint8_t* script_bytes = reinterpret_cast<const uint8_t*>(script_stream.data());
+    preimage.insert(preimage.end(), script_bytes, script_bytes + script_stream.size());
+
+    return sha2::sha512_256(preimage.data(), preimage.size());
 }
 
 std::unique_ptr<UpdateUtreexo> g_updateutreexo;
@@ -123,6 +168,13 @@ UpdateUtreexo::~UpdateUtreexo()
     }
 }
 
+interfaces::Chain::NotifyOptions UpdateUtreexo::CustomOptions()
+{
+    interfaces::Chain::NotifyOptions options;
+    options.connect_undo_data = true;
+    return options;
+}
+
 bool UpdateUtreexo::CustomAppend(const interfaces::BlockInfo& block)
 {
     // Skip genesis block
@@ -134,64 +186,72 @@ bool UpdateUtreexo::CustomAppend(const interfaces::BlockInfo& block)
     }
 
     const unsigned char* utreexo_tag = GetUtreexoTag();
-    std::vector<uint8_t> utxo_hashes;
-    size_t total_utxos = 0;
+
+    std::vector<uint8_t> del_hashes;
+    size_t total_del = 0;
+
+    if (block.undo_data) {
+        // vtxundo has one entry per non-coinbase transaction
+        for (size_t i = 0; i < block.undo_data->vtxundo.size(); ++i) {
+            const auto& tx = block.data->vtx[i + 1]; // +1 to skip coinbase
+            const auto& txundo = block.undo_data->vtxundo[i];
+
+            for (size_t j = 0; j < txundo.vprevout.size(); ++j) {
+                const Coin& coin = txundo.vprevout[j];
+                const COutPoint& prevout = tx->vin[j].prevout;
+
+                uint256 creating_block_hash = m_chain->getBlockHash(coin.nHeight);
+
+                sha2::sha256_hash leaf_hash = ComputeLeafHash(
+                    utreexo_tag,
+                    reinterpret_cast<const uint8_t*>(creating_block_hash.data()),
+                    reinterpret_cast<const uint8_t*>(prevout.hash.data()),
+                    prevout.n,
+                    coin.nHeight,
+                    coin.fCoinBase,
+                    coin.out);
+
+                del_hashes.insert(del_hashes.end(), leaf_hash.begin(), leaf_hash.end());
+                ++total_del;
+            }
+        }
+    }
+
+    // Collect hashes of new UTXOs to add to the forest
+    std::vector<uint8_t> add_hashes;
+    size_t total_add = 0;
 
     for (const auto& tx : block.data->vtx) {
         const Txid& txid = tx->GetHash();
         const bool is_coinbase = tx->IsCoinBase();
 
         for (uint32_t vout = 0; vout < tx->vout.size(); ++vout) {
-            const CTxOut& output = tx->vout[vout];
+            sha2::sha256_hash leaf_hash = ComputeLeafHash(
+                utreexo_tag,
+                reinterpret_cast<const uint8_t*>(block.hash.data()),
+                reinterpret_cast<const uint8_t*>(txid.data()),
+                vout,
+                static_cast<uint32_t>(block.height),
+                is_coinbase,
+                tx->vout[vout]);
 
-            uint32_t header_code = (static_cast<uint32_t>(block.height) << 1) | (is_coinbase ? 1 : 0);
-
-            DataStream script_stream;
-            script_stream << output.scriptPubKey;
-
-            std::vector<uint8_t> preimage;
-            preimage.reserve(64 + 64 + 32 + 32 + 4 + 4 + 8 + script_stream.size());
-
-            preimage.insert(preimage.end(), utreexo_tag, utreexo_tag + 64);
-            preimage.insert(preimage.end(), utreexo_tag, utreexo_tag + 64);
-
-            const uint8_t* block_hash = reinterpret_cast<const uint8_t*>(block.hash.data());
-            preimage.insert(preimage.end(), block_hash, block_hash + 32);
-
-            const uint8_t* txid_bytes = reinterpret_cast<const uint8_t*>(txid.data());
-            preimage.insert(preimage.end(), txid_bytes, txid_bytes + 32);
-
-            uint32_t vout_le = htole32(vout);
-            const uint8_t* vout_bytes = reinterpret_cast<const uint8_t*>(&vout_le);
-            preimage.insert(preimage.end(), vout_bytes, vout_bytes + 4);
-
-            uint32_t header_code_le = htole32(header_code);
-            const uint8_t* header_bytes = reinterpret_cast<const uint8_t*>(&header_code_le);
-            preimage.insert(preimage.end(), header_bytes, header_bytes + 4);
-
-            uint64_t amount_le = htole64(static_cast<uint64_t>(output.nValue));
-            const uint8_t* amount_bytes = reinterpret_cast<const uint8_t*>(&amount_le);
-            preimage.insert(preimage.end(), amount_bytes, amount_bytes + 8);
-
-            const uint8_t* script_bytes = reinterpret_cast<const uint8_t*>(script_stream.data());
-            preimage.insert(preimage.end(), script_bytes, script_bytes + script_stream.size());
-
-            sha2::sha256_hash leaf_hash = sha2::sha512_256(preimage.data(), preimage.size());
-
-            utxo_hashes.insert(utxo_hashes.end(), leaf_hash.begin(), leaf_hash.end());
-            ++total_utxos;
+            add_hashes.insert(add_hashes.end(), leaf_hash.begin(), leaf_hash.end());
+            ++total_add;
         }
     }
 
-    if (!utxo_hashes.empty()) {
-        int result = utreexo_forest_modify(m_forest, utxo_hashes.data(), total_utxos, nullptr, 0);
+    const uint8_t* add_ptr = add_hashes.empty() ? nullptr : add_hashes.data();
+    const uint8_t* del_ptr = del_hashes.empty() ? nullptr : del_hashes.data();
+
+    if (total_add > 0 || total_del > 0) {
+        int result = utreexo_forest_modify(m_forest, add_ptr, total_add, del_ptr, total_del);
         if (result != 0) {
-            LogError("UpdateUtreexo: Failed to add %zu UTXOs to forest at height %d\n",
-                     total_utxos, block.height);
+            LogError("UpdateUtreexo: Failed to modify forest at height %d (+%zu -%zu)\n",
+                     block.height, total_add, total_del);
             return false;
         }
-        LogDebug(BCLog::ALL, "UpdateUtreexo: Added %zu UTXOs to forest at height %d\n",
-                 total_utxos, block.height);
+        LogDebug(BCLog::ALL, "UpdateUtreexo: Modified forest at height %d: +%zu -%zu UTXOs\n",
+                 block.height, total_add, total_del);
     }
 
     if (!SaveForest()) {

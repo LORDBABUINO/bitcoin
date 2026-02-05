@@ -37,6 +37,7 @@ private:
 protected:
     bool CustomAppend(const interfaces::BlockInfo& block) override;
     BaseIndex::DB& GetDB() const override;
+    interfaces::Chain::NotifyOptions CustomOptions() override;
 
 public:
     explicit UpdateUtreexo(std::unique_ptr<interfaces::Chain> chain, size_t n_cache_size,
