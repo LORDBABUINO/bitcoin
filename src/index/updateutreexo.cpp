@@ -20,6 +20,7 @@
 #include <util/rustreexo.h>
 
 #include <cstring>
+#include <future>
 #include <stdexcept>
 #include <vector>
 
@@ -187,11 +188,37 @@ bool UpdateUtreexo::CustomAppend(const interfaces::BlockInfo& block)
 
     const unsigned char* utreexo_tag = GetUtreexoTag();
 
+    auto add_future = std::async(std::launch::async, [&]() {
+        std::vector<uint8_t> hashes;
+        size_t count = 0;
+
+        for (const auto& tx : block.data->vtx) {
+            const Txid& txid = tx->GetHash();
+            const bool is_coinbase = tx->IsCoinBase();
+
+            for (uint32_t vout = 0; vout < tx->vout.size(); ++vout) {
+                sha2::sha256_hash leaf_hash = ComputeLeafHash(
+                    utreexo_tag,
+                    reinterpret_cast<const uint8_t*>(block.hash.data()),
+                    reinterpret_cast<const uint8_t*>(txid.data()),
+                    vout,
+                    static_cast<uint32_t>(block.height),
+                    is_coinbase,
+                    tx->vout[vout]);
+
+                hashes.insert(hashes.end(), leaf_hash.begin(), leaf_hash.end());
+                ++count;
+            }
+        }
+
+        return std::make_pair(std::move(hashes), count);
+    });
+
+    // Collect deletion hashes on the current thread
     std::vector<uint8_t> del_hashes;
     size_t total_del = 0;
 
     if (block.undo_data) {
-        // vtxundo has one entry per non-coinbase transaction
         for (size_t i = 0; i < block.undo_data->vtxundo.size(); ++i) {
             const auto& tx = block.data->vtx[i + 1]; // +1 to skip coinbase
             const auto& txundo = block.undo_data->vtxundo[i];
@@ -217,28 +244,7 @@ bool UpdateUtreexo::CustomAppend(const interfaces::BlockInfo& block)
         }
     }
 
-    // Collect hashes of new UTXOs to add to the forest
-    std::vector<uint8_t> add_hashes;
-    size_t total_add = 0;
-
-    for (const auto& tx : block.data->vtx) {
-        const Txid& txid = tx->GetHash();
-        const bool is_coinbase = tx->IsCoinBase();
-
-        for (uint32_t vout = 0; vout < tx->vout.size(); ++vout) {
-            sha2::sha256_hash leaf_hash = ComputeLeafHash(
-                utreexo_tag,
-                reinterpret_cast<const uint8_t*>(block.hash.data()),
-                reinterpret_cast<const uint8_t*>(txid.data()),
-                vout,
-                static_cast<uint32_t>(block.height),
-                is_coinbase,
-                tx->vout[vout]);
-
-            add_hashes.insert(add_hashes.end(), leaf_hash.begin(), leaf_hash.end());
-            ++total_add;
-        }
-    }
+    auto [add_hashes, total_add] = add_future.get();
 
     const uint8_t* add_ptr = add_hashes.empty() ? nullptr : add_hashes.data();
     const uint8_t* del_ptr = del_hashes.empty() ? nullptr : del_hashes.data();
