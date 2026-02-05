@@ -9,6 +9,8 @@
 
 #include <cstddef>
 #include <memory>
+#include <utility>
+#include <vector>
 #include <util/fs.h>
 
 struct UtreexoForest;
@@ -33,9 +35,15 @@ private:
 
     bool LoadForest();
     bool SaveForest();
+    std::pair<std::vector<uint8_t>, size_t> CollectSpentHashes(
+        const interfaces::BlockInfo& block, const unsigned char* utreexo_tag);
+    bool ProcessBlock(const interfaces::BlockInfo& block,
+                      std::vector<uint8_t>& add_hashes, size_t add_count,
+                      std::vector<uint8_t>& del_hashes, size_t del_count);
 
 protected:
     bool CustomAppend(const interfaces::BlockInfo& block) override;
+    bool CustomRemove(const interfaces::BlockInfo& block) override;
     BaseIndex::DB& GetDB() const override;
     interfaces::Chain::NotifyOptions CustomOptions() override;
 

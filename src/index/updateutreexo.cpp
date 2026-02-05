@@ -173,50 +173,44 @@ interfaces::Chain::NotifyOptions UpdateUtreexo::CustomOptions()
 {
     interfaces::Chain::NotifyOptions options;
     options.connect_undo_data = true;
+    options.disconnect_data = true;
+    options.disconnect_undo_data = true;
     return options;
 }
 
-bool UpdateUtreexo::CustomAppend(const interfaces::BlockInfo& block)
+static std::pair<std::vector<uint8_t>, size_t> CollectOutputHashes(
+    const interfaces::BlockInfo& block, const unsigned char* utreexo_tag)
 {
-    // Skip genesis block
-    if (block.height == 0) return true;
+    std::vector<uint8_t> hashes;
+    size_t count = 0;
 
-    if (!block.data) {
-        LogWarning("UpdateUtreexo: Block data not available for height %d\n", block.height);
-        return false;
+    for (const auto& tx : block.data->vtx) {
+        const Txid& txid = tx->GetHash();
+        const bool is_coinbase = tx->IsCoinBase();
+
+        for (uint32_t vout = 0; vout < tx->vout.size(); ++vout) {
+            sha2::sha256_hash leaf_hash = ComputeLeafHash(
+                utreexo_tag,
+                reinterpret_cast<const uint8_t*>(block.hash.data()),
+                reinterpret_cast<const uint8_t*>(txid.data()),
+                vout,
+                static_cast<uint32_t>(block.height),
+                is_coinbase,
+                tx->vout[vout]);
+
+            hashes.insert(hashes.end(), leaf_hash.begin(), leaf_hash.end());
+            ++count;
+        }
     }
 
-    const unsigned char* utreexo_tag = GetUtreexoTag();
+    return {std::move(hashes), count};
+}
 
-    auto add_future = std::async(std::launch::async, [&]() {
-        std::vector<uint8_t> hashes;
-        size_t count = 0;
-
-        for (const auto& tx : block.data->vtx) {
-            const Txid& txid = tx->GetHash();
-            const bool is_coinbase = tx->IsCoinBase();
-
-            for (uint32_t vout = 0; vout < tx->vout.size(); ++vout) {
-                sha2::sha256_hash leaf_hash = ComputeLeafHash(
-                    utreexo_tag,
-                    reinterpret_cast<const uint8_t*>(block.hash.data()),
-                    reinterpret_cast<const uint8_t*>(txid.data()),
-                    vout,
-                    static_cast<uint32_t>(block.height),
-                    is_coinbase,
-                    tx->vout[vout]);
-
-                hashes.insert(hashes.end(), leaf_hash.begin(), leaf_hash.end());
-                ++count;
-            }
-        }
-
-        return std::make_pair(std::move(hashes), count);
-    });
-
-    // Collect deletion hashes on the current thread
-    std::vector<uint8_t> del_hashes;
-    size_t total_del = 0;
+std::pair<std::vector<uint8_t>, size_t> UpdateUtreexo::CollectSpentHashes(
+    const interfaces::BlockInfo& block, const unsigned char* utreexo_tag)
+{
+    std::vector<uint8_t> hashes;
+    size_t count = 0;
 
     if (block.undo_data) {
         for (size_t i = 0; i < block.undo_data->vtxundo.size(); ++i) {
@@ -238,34 +232,76 @@ bool UpdateUtreexo::CustomAppend(const interfaces::BlockInfo& block)
                     coin.fCoinBase,
                     coin.out);
 
-                del_hashes.insert(del_hashes.end(), leaf_hash.begin(), leaf_hash.end());
-                ++total_del;
+                hashes.insert(hashes.end(), leaf_hash.begin(), leaf_hash.end());
+                ++count;
             }
         }
     }
 
-    auto [add_hashes, total_add] = add_future.get();
+    return {std::move(hashes), count};
+}
 
+bool UpdateUtreexo::ProcessBlock(
+    const interfaces::BlockInfo& block,
+    std::vector<uint8_t>& add_hashes,
+    size_t add_count,
+    std::vector<uint8_t>& del_hashes,
+    size_t del_count)
+{
     const uint8_t* add_ptr = add_hashes.empty() ? nullptr : add_hashes.data();
     const uint8_t* del_ptr = del_hashes.empty() ? nullptr : del_hashes.data();
 
-    if (total_add > 0 || total_del > 0) {
-        int result = utreexo_forest_modify(m_forest, add_ptr, total_add, del_ptr, total_del);
+    if (add_count > 0 || del_count > 0) {
+        int result = utreexo_forest_modify(m_forest, add_ptr, add_count, del_ptr, del_count);
         if (result != 0) {
-            LogError("UpdateUtreexo: Failed to modify forest at height %d (+%zu -%zu)\n",
-                     block.height, total_add, total_del);
+            LogError("UpdateUtreexo: Failed to update forest at height %d (+%zu -%zu)\n",
+                     block.height, add_count, del_count);
             return false;
         }
-        LogDebug(BCLog::ALL, "UpdateUtreexo: Modified forest at height %d: +%zu -%zu UTXOs\n",
-                 block.height, total_add, total_del);
+        LogDebug(BCLog::ALL, "UpdateUtreexo: Updated forest at height %d: +%zu -%zu UTXOs\n",
+                 block.height, add_count, del_count);
     }
 
     if (!SaveForest()) {
-        LogError("UpdateUtreexo: Failed to save forest after block %d\n", block.height);
+        LogError("UpdateUtreexo: Failed to save forest at height %d\n", block.height);
         return false;
     }
 
     return true;
+}
+
+bool UpdateUtreexo::CustomAppend(const interfaces::BlockInfo& block)
+{
+    if (block.height == 0) return true;
+    if (!block.data) {
+        LogWarning("UpdateUtreexo: Block data not available at height %d\n", block.height);
+        return false;
+    }
+
+    const unsigned char* utreexo_tag = GetUtreexoTag();
+
+    auto output_future = std::async(std::launch::async, CollectOutputHashes, std::cref(block), utreexo_tag);
+    auto [del_hashes, del_count] = CollectSpentHashes(block, utreexo_tag);
+    auto [add_hashes, add_count] = output_future.get();
+
+    return ProcessBlock(block, add_hashes, add_count, del_hashes, del_count);
+}
+
+bool UpdateUtreexo::CustomRemove(const interfaces::BlockInfo& block)
+{
+    if (block.height == 0) return true;
+    if (!block.data) {
+        LogWarning("UpdateUtreexo: Block data not available at height %d\n", block.height);
+        return false;
+    }
+
+    const unsigned char* utreexo_tag = GetUtreexoTag();
+
+    auto output_future = std::async(std::launch::async, CollectOutputHashes, std::cref(block), utreexo_tag);
+    auto [add_hashes, add_count] = CollectSpentHashes(block, utreexo_tag);
+    auto [del_hashes, del_count] = output_future.get();
+
+    return ProcessBlock(block, add_hashes, add_count, del_hashes, del_count);
 }
 
 BaseIndex::DB& UpdateUtreexo::GetDB() const { return *m_db; }
