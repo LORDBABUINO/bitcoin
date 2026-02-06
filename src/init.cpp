@@ -27,6 +27,7 @@
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
 #include <index/txindex.h>
+#include <index/updateutreexo.h>
 #include <init/common.h>
 #include <interfaces/chain.h>
 #include <interfaces/init.h>
@@ -360,6 +361,7 @@ void Shutdown(NodeContext& node)
     for (auto* index : node.indexes) index->Stop();
     if (g_txindex) g_txindex.reset();
     if (g_coin_stats_index) g_coin_stats_index.reset();
+    if (g_updateutreexo) g_updateutreexo.reset();
     DestroyAllBlockFilterIndexes();
     node.indexes.clear(); // all instances are nullptr now
 
@@ -523,6 +525,8 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-shutdownnotify=<cmd>", "Execute command immediately before beginning shutdown. The need for shutdown may be urgent, so be careful not to delay it long (if the command doesn't require interaction with the server, consider having it fork into the background).", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #endif
     argsman.AddArg("-txindex", strprintf("Maintain a full transaction index, used by the getrawtransaction rpc call (default: %u)", DEFAULT_TXINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-updateutreexo", strprintf("Update Utreexo commitments and proofs in block files when reindexing or importing blocks (default: %u)", DEFAULT_UPDATE_UTREEXO), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-utreexopath=<path>", "Specify directory to store Utreexo accumulator data (default: <datadir>/utreexo)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blockfilterindex=<type>",
                  strprintf("Maintain an index of compact filters by block (default: %s, values: %s).", DEFAULT_BLOCKFILTERINDEX, ListBlockFilterTypes()) +
                  " If <type> is not supplied or if <type> = 1, indexes for all known types are enabled.",
@@ -1870,6 +1874,11 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (args.GetBoolArg("-coinstatsindex", DEFAULT_COINSTATSINDEX)) {
         g_coin_stats_index = std::make_unique<CoinStatsIndex>(interfaces::MakeChain(node), /*cache_size=*/0, false, do_reindex);
         node.indexes.emplace_back(g_coin_stats_index.get());
+    }
+
+    if (args.GetBoolArg("-updateutreexo", DEFAULT_UPDATE_UTREEXO)) {
+        g_updateutreexo = std::make_unique<UpdateUtreexo>(interfaces::MakeChain(node), 1 << 20, false, do_reindex);
+        node.indexes.emplace_back(g_updateutreexo.get());
     }
 
     // Init indexes

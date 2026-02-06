@@ -127,6 +127,18 @@ if(WITH_ZMQ)
   find_package(ZeroMQ 4.0.0 MODULE REQUIRED)
 endif()
 
+option(WITH_UTREEXO "Enable Utreexo index (requires UTREEXO_LIB_PATH)." OFF)
+if(WITH_UTREEXO)
+  if(NOT DEFINED UTREEXO_LIB_PATH)
+    message(FATAL_ERROR "WITH_UTREEXO is enabled but UTREEXO_LIB_PATH is not set. "
+                        "Please specify the path to libutreexo_ffi.a using -DUTREEXO_LIB_PATH=/path/to/libutreexo_ffi.a")
+  endif()
+  if(NOT EXISTS "${UTREEXO_LIB_PATH}")
+    message(FATAL_ERROR "UTREEXO_LIB_PATH is set to '${UTREEXO_LIB_PATH}' but the file does not exist.")
+  endif()
+  message(STATUS "Utreexo index enabled with library: ${UTREEXO_LIB_PATH}")
+endif()
+
 option(WITH_USDT "Enable tracepoints for Userspace, Statically Defined Tracing." OFF)
 if(WITH_USDT)
   find_package(USDT MODULE REQUIRED)
